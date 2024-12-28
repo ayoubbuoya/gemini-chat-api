@@ -48,8 +48,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-
-# --- API Endpoints - --
+# --- API Endpoints ---
 
 
 @app.route('/chat', methods=['POST'])
@@ -64,8 +63,11 @@ def chat():
     # Load chat history from the database
     chat_history = get_chat_history(user_id)
 
+    # Start a new chat or get existing one based on user id.
+    chat = get_or_create_chat_session(user_id, chat_history)
+
     # Send message to Gemini 1.5 Pro with context
-    gemini_response = send_to_gemini(chat_history, user_message)
+    gemini_response = send_message_to_gemini(chat, user_message)
 
     # Store user and model response in the database
     store_message(user_id, "user", user_message)
@@ -77,7 +79,6 @@ def chat():
 @app.route('/history/<user_id>', methods=['GET'])
 def get_chat_history_api(user_id):
     history = get_chat_history(user_id)
-    # Convert rows to dictionaries
     return jsonify({'history': [dict(row) for row in history]})
 
 # --- Helper Functions ---
@@ -93,14 +94,24 @@ def get_chat_history(user_id):
     return history
 
 
-def send_to_gemini(chat_history, user_message):
-    messages = []
-    for row in chat_history:
-        messages.append({"role": row["role"], "parts": [row["content"]]})
-    messages.append({"role": "user", "parts": [user_message]})
+# A mapping to hold chat objects so that users can continue their conversations.
+chat_sessions = {}
 
+
+def get_or_create_chat_session(user_id, chat_history):
+    if user_id in chat_sessions:
+        chat = chat_sessions[user_id]
+        return chat
+    else:
+        chat = model.start_chat(history=[{"role": row["role"], "parts": [
+                                row["content"]]} for row in chat_history])
+        chat_sessions[user_id] = chat
+        return chat
+
+
+def send_message_to_gemini(chat, user_message):
     try:
-        response = model.generate_content(messages)
+        response = chat.send_message(user_message)
         return response.text
     except Exception as e:
         return f"Error with Gemini: {str(e)}"
@@ -113,11 +124,6 @@ def store_message(user_id, role, content):
         "INSERT INTO chat_history (user_id, role, content) VALUES (?, ?, ?)", (user_id, role, content))
     conn.commit()
     conn.close()
-
-
-@app.route('/ping', methods=['GET'])
-def ping():
-    return jsonify({"message": "Pong!"}), 200
 
 
 if __name__ == '__main__':
