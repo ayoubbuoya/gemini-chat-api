@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime
 import google.generativeai as genai
 from dotenv import load_dotenv
+import uuid
 
 # Load environment variables
 load_dotenv()
@@ -40,6 +41,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS chat_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             role TEXT NOT NULL,
             content TEXT NOT NULL
@@ -47,6 +49,7 @@ def init_db():
     ''')
     conn.commit()
     conn.close()
+
 
 # --- API Endpoints ---
 
@@ -58,54 +61,74 @@ def chat():
         return jsonify({'error': 'Missing user_id or message'}), 400
 
     user_id = data['user_id']
-    user_message = data['message']
+    message = data['message']
+    chat_id = data.get('chat_id')  # Optional chat_id (for existing chats)
 
-    # Load chat history from the database
-    chat_history = get_chat_history(user_id)
+    if not chat_id:  # Create new chat ID if it doesn't exist
+        chat_id = str(uuid.uuid4())
 
-    # Start a new chat or get existing one based on user id.
-    chat = get_or_create_chat_session(user_id, chat_history)
+    # Load chat history for specific chat
+    chat_history = get_chat_history(user_id, chat_id)
 
-    # Send message to Gemini 1.5 Pro with context
-    gemini_response = send_message_to_gemini(chat, user_message)
+    # Start or get the chat object
+    chat = get_or_create_chat_session(user_id, chat_id, chat_history)
 
-    # Store user and model response in the database
-    store_message(user_id, "user", user_message)
-    store_message(user_id, "model", gemini_response)
+    # Send message to Gemini and store response
+    gemini_response = send_message_to_gemini(chat, message)
+    store_message(user_id, chat_id, "user", message)
+    store_message(user_id, chat_id, "model", gemini_response)
 
-    return jsonify({'response': gemini_response})
+    # return chat_id as well to let user be aware
+    return jsonify({'response': gemini_response, 'chat_id': chat_id})
 
 
 @app.route('/history/<user_id>', methods=['GET'])
-def get_chat_history_api(user_id):
-    history = get_chat_history(user_id)
+def get_user_chat_sessions(user_id):
+    sessions = get_all_chat_ids(user_id)
+    return jsonify({'chat_sessions': sessions})
+
+
+@app.route('/history/<user_id>/<chat_id>', methods=['GET'])
+def get_chat_history_api(user_id, chat_id):
+    history = get_chat_history(user_id, chat_id)
     return jsonify({'history': [dict(row) for row in history]})
 
 # --- Helper Functions ---
 
 
-def get_chat_history(user_id):
+def get_chat_history(user_id, chat_id):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT role, content FROM chat_history WHERE user_id = ? ORDER BY timestamp", (user_id,))
+        "SELECT role, content FROM chat_history WHERE user_id = ? AND chat_id = ? ORDER BY timestamp", (user_id, chat_id))
     history = cursor.fetchall()
     conn.close()
     return history
+
+
+def get_all_chat_ids(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT DISTINCT chat_id FROM chat_history WHERE user_id = ?", (user_id,))
+    sessions = [row["chat_id"] for row in cursor.fetchall()]
+    conn.close()
+    return sessions
 
 
 # A mapping to hold chat objects so that users can continue their conversations.
 chat_sessions = {}
 
 
-def get_or_create_chat_session(user_id, chat_history):
-    if user_id in chat_sessions:
-        chat = chat_sessions[user_id]
+def get_or_create_chat_session(user_id, chat_id, chat_history):
+    key = (user_id, chat_id)  # Using tuples as dict keys
+    if key in chat_sessions:
+        chat = chat_sessions[key]
         return chat
     else:
         chat = model.start_chat(history=[{"role": row["role"], "parts": [
                                 row["content"]]} for row in chat_history])
-        chat_sessions[user_id] = chat
+        chat_sessions[key] = chat
         return chat
 
 
@@ -117,11 +140,11 @@ def send_message_to_gemini(chat, user_message):
         return f"Error with Gemini: {str(e)}"
 
 
-def store_message(user_id, role, content):
+def store_message(user_id, chat_id, role, content):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO chat_history (user_id, role, content) VALUES (?, ?, ?)", (user_id, role, content))
+    cursor.execute("INSERT INTO chat_history (user_id, chat_id, role, content) VALUES (?, ?, ?, ?)",
+                   (user_id, chat_id, role, content))
     conn.commit()
     conn.close()
 
